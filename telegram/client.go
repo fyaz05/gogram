@@ -428,7 +428,7 @@ func (c *Client) IsConnected() bool {
 }
 
 func (c *Client) Start() error {
-	c.MTProto.SetTerminated(false) // reset the terminated state
+	c.MTProto.SetTerminated(false)
 	if !c.IsConnected() {
 		if err := c.Connect(); err != nil {
 			return err
@@ -442,20 +442,44 @@ func (c *Client) Start() error {
 		return err
 	}
 
-	c.stopCh = make(chan struct{}) // reset the stop channel
+	c.resetBackground()
 	return nil
 }
 
 func (c *Client) St() error {
-	c.MTProto.SetTerminated(false) // reset the terminated state
+	c.MTProto.SetTerminated(false)
 	if !c.IsConnected() {
 		if err := c.Connect(); err != nil {
 			return err
 		}
 	}
 
-	c.stopCh = make(chan struct{}) // reset the stop channel
+	c.resetBackground()
 	return nil
+}
+
+func (c *Client) resetBackground() {
+	if c.stopCh != nil {
+		select {
+		case <-c.stopCh:
+			c.stopCh = make(chan struct{})
+		default:
+		}
+	} else {
+		c.stopCh = make(chan struct{})
+	}
+	if c.dispatcher != nil {
+		c.dispatcher.stopMu.Lock()
+		select {
+		case <-c.dispatcher.stopChan:
+			c.dispatcher.stopChan = make(chan struct{})
+		default:
+		}
+		c.dispatcher.stopMu.Unlock()
+	}
+	if c.exSenders != nil {
+		c.exSenders.ensureRunning()
+	}
 }
 
 // Returns true if the client is authorized as a user or a bot
@@ -470,7 +494,30 @@ func (c *Client) IsAuthorized() (bool, error) {
 
 // Disconnect from telegram servers
 func (c *Client) Disconnect() error {
+	c.shutdownBackground()
 	return c.MTProto.Disconnect()
+}
+
+func (c *Client) shutdownBackground() {
+	if c.stopCh != nil {
+		select {
+		case <-c.stopCh:
+		default:
+			close(c.stopCh)
+		}
+	}
+	if c.dispatcher != nil {
+		c.dispatcher.stopMu.Lock()
+		select {
+		case <-c.dispatcher.stopChan:
+		default:
+			close(c.dispatcher.stopChan)
+		}
+		c.dispatcher.stopMu.Unlock()
+	}
+	if c.exSenders != nil {
+		c.exSenders.Close()
+	}
 }
 
 // switchDC permanently switches the data center
@@ -507,7 +554,7 @@ type ExSenders struct {
 	sync.Mutex
 	senders     map[int][]*ExSender
 	cleanupDone chan struct{}
-	closeOnce   sync.Once
+	running     bool
 }
 
 type ExSender struct {
@@ -531,14 +578,26 @@ func (es *ExSender) GetLastUsedTime() time.Time {
 
 func NewExSenders() *ExSenders {
 	es := &ExSenders{
-		senders:     make(map[int][]*ExSender),
-		cleanupDone: make(chan struct{}),
+		senders: make(map[int][]*ExSender),
 	}
-	go es.cleanupLoop()
+	es.ensureRunning()
 	return es
 }
 
-func (es *ExSenders) cleanupLoop() {
+func (es *ExSenders) ensureRunning() {
+	es.Lock()
+	if es.running {
+		es.Unlock()
+		return
+	}
+	es.cleanupDone = make(chan struct{})
+	es.running = true
+	done := es.cleanupDone
+	es.Unlock()
+	go es.cleanupLoop(done)
+}
+
+func (es *ExSenders) cleanupLoop(done <-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Minute)
 	defer ticker.Stop()
 
@@ -546,7 +605,7 @@ func (es *ExSenders) cleanupLoop() {
 		select {
 		case <-ticker.C:
 			es.cleanupIdleSenders()
-		case <-es.cleanupDone:
+		case <-done:
 			return
 		}
 	}
@@ -597,20 +656,33 @@ func (es *ExSenders) AddSender(dcID int, sender *ExSender) {
 }
 
 func (es *ExSenders) Close() {
-	es.closeOnce.Do(func() {
-		close(es.cleanupDone)
+	es.Lock()
+	if !es.running {
+		es.Unlock()
+		return
+	}
+	es.running = false
+	done := es.cleanupDone
+	es.cleanupDone = nil
+	senders := es.senders
+	es.senders = make(map[int][]*ExSender)
+	es.Unlock()
 
-		es.Lock()
-		defer es.Unlock()
-		for _, senders := range es.senders {
-			for _, sender := range senders {
-				if sender != nil {
-					sender.Terminate()
-				}
+	if done != nil {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
+
+	for _, list := range senders {
+		for _, sender := range list {
+			if sender != nil {
+				sender.Terminate()
 			}
 		}
-		es.senders = make(map[int][]*ExSender)
-	})
+	}
 }
 
 // CreateExportedSender creates a new exported sender for the given DC.
@@ -882,6 +954,7 @@ func (c *Client) SetCommandPrefixes(prefixes string) {
 
 // Terminate client and disconnect from telegram server
 func (c *Client) Terminate() error {
+	c.shutdownBackground()
 	return c.MTProto.Terminate()
 }
 
@@ -895,21 +968,15 @@ func (c *Client) Idle() {
 	case <-sigchan:
 		c.Stop()
 	case <-c.stopCh:
-		c.exSenders.Close()
 	}
 
+	c.shutdownBackground()
 	c.wg.Wait()
 }
 
 // Stop stops the client and disconnects from telegram server
 func (c *Client) Stop() error {
-	// close(c.stopCh)
-	select {
-	case <-c.stopCh:
-	default:
-		close(c.stopCh)
-	}
-
+	c.shutdownBackground()
 	return c.MTProto.Terminate()
 }
 

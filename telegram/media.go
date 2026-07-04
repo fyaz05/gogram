@@ -400,11 +400,14 @@ func (c *Client) UploadFile(src any, Opts ...*UploadOptions) (InputFile, error) 
 	w := NewWorkerPool(numWorkers)
 	defer w.Close()
 
-	if err := initializeWorkersWithMode(numWorkers, int32(c.GetDC()), c, w, !opts.NoMediaDC); err != nil {
+	uploadCtx, uploadCancel := context.WithCancel(rootCtx(opts.Ctx))
+	defer uploadCancel()
+
+	if err := initializeWorkersWithMode(numWorkers, int32(c.GetDC()), c, w, !opts.NoMediaDC, uploadCtx); err != nil {
 		return nil, err
 	}
 
-	initCtx, initCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	initCtx, initCancel := context.WithTimeout(uploadCtx, 15*time.Second)
 	if !w.WaitReady(initCtx) {
 		initCancel()
 		return nil, errors.New("failed to initialize upload workers: timeout")
@@ -447,9 +450,6 @@ func (c *Client) UploadFile(src any, Opts ...*UploadOptions) (InputFile, error) 
 		})
 		progressTracker.start(&doneBytes)
 	}
-
-	uploadCtx, uploadCancel := context.WithCancel(rootCtx(opts.Ctx))
-	defer uploadCancel()
 
 	var md5sum hash.Hash
 	if !isBigFile {
@@ -2321,7 +2321,13 @@ func (pt *progressTracker) start(doneBytes *atomic.Int64) {
 }
 
 func (pt *progressTracker) stop() {
-	close(pt.stopChan)
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	select {
+	case <-pt.stopChan:
+	default:
+		close(pt.stopChan)
+	}
 }
 
 // ProgressManager provides progress tracking for uploads and downloads

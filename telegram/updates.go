@@ -960,6 +960,7 @@ type UpdateDispatcher struct {
 	recoveringDifference  bool
 	recoveringChannels    map[int64]bool
 	stopChan              chan struct{}
+	stopMu                sync.Mutex
 	patternCache          *patternCache
 	middlewareManager     *middlewareManager
 	globalPtsBox          *counterBox
@@ -3244,11 +3245,19 @@ func (c *Client) manageSeq(seq int32, seqStart int32) bool {
 	d.Unlock()
 
 	go func(targetSeqStart int32) {
-		time.Sleep(300 * time.Millisecond)
+		select {
+		case <-time.After(300 * time.Millisecond):
+		case <-c.dispatcher.stopChan:
+			return
+		}
 		if c.dispatcher.GetSeq()+1 >= targetSeqStart {
 			return
 		}
-
+		select {
+		case <-c.dispatcher.stopChan:
+			return
+		default:
+		}
 		freshPts := c.dispatcher.GetPts()
 		if freshPts == 0 {
 			freshPts = currentPts
@@ -3537,7 +3546,17 @@ func (c *Client) pollOpenChat(channelID int64, chat *openChat) {
 		select {
 		case <-chat.closeChan:
 			return
+		case <-c.dispatcher.stopChan:
+			return
 		case <-time.After(timeout):
+		}
+
+		if c.dispatcher != nil {
+			select {
+			case <-c.dispatcher.stopChan:
+				return
+			default:
+			}
 		}
 
 		diff, err := c.UpdatesGetChannelDifference(&UpdatesGetChannelDifferenceParams{

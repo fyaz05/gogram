@@ -676,8 +676,10 @@ func (m *MTProto) CreateConnection(withLog bool) error {
 	m.startReadingResponses(ctx)
 
 	if !m.exported && !m.cdn {
+		m.routineswg.Add(1)
 		go m.longPing(ctx)
 		if m.isHTTPTransport() {
+			m.routineswg.Add(1)
 			go m.httpWaiter(ctx)
 		}
 	}
@@ -1065,7 +1067,18 @@ func (m *MTProto) Disconnect() error {
 	case <-done:
 		m.Logger.Trace("all routines stopped gracefully")
 	case <-time.After(10 * time.Second):
-		m.Logger.Debug("timeout waiting for routines to stop on disconnect")
+		m.Logger.Debug("timeout waiting for routines to stop on disconnect; forcing transport close")
+		m.transportMu.Lock()
+		if m.transport != nil {
+			m.transport.Close()
+			m.transport = nil
+		}
+		m.transportMu.Unlock()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			m.Logger.Debug("routines still alive after force close")
+		}
 	}
 
 	return nil
@@ -1113,6 +1126,17 @@ func (m *MTProto) Reconnect(loggy bool) error {
 
 	m.tcpState.SetActive(false)
 	m.stopRoutines()
+
+	drained := make(chan struct{})
+	go func() {
+		m.routineswg.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		m.Logger.Debug("reconnect: routines did not drain in time")
+	}
 
 	err := m.CreateConnection(loggy)
 	if err != nil {
@@ -1163,7 +1187,6 @@ func (m *MTProto) Redial() error {
 
 // keep pinging to keep the connection alive
 func (m *MTProto) longPing(ctx context.Context) {
-	m.routineswg.Add(1)
 	defer m.routineswg.Done()
 
 	ticker := time.NewTicker(defaultPingInterval)
@@ -1194,7 +1217,6 @@ func (m *MTProto) isHTTPTransport() bool {
 }
 
 func (m *MTProto) httpWaiter(ctx context.Context) {
-	m.routineswg.Add(1)
 	defer m.routineswg.Done()
 
 	for {
@@ -1528,7 +1550,12 @@ messageTypeSwitching:
 				info[i] = 0x01
 			}
 		}
+		m.routineswg.Add(1)
 		go func() {
+			defer m.routineswg.Done()
+			if m.terminated.Load() {
+				return
+			}
 			if _, err := m.MakeRequest(&objects.MsgsStateInfo{ReqMsgID: int64(msg.GetMsgID()), Info: info}); err != nil {
 				m.Logger.Debug("msgs_state_info: %v", err)
 			}
