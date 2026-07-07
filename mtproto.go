@@ -302,13 +302,11 @@ func NewMTProto(c Config) (*MTProto, error) {
 
 func parseTransportMode(sMode string) mode.Variant {
 	switch sMode {
-	case "Abridged", "modeAbridged", "abridged", "":
-		return mode.Abridged
-	case "Full", "modeFull", "full":
+	case "Full":
 		return mode.Full
-	case "Intermediate", "modeIntermediate", "intermediate":
+	case "Intermediate":
 		return mode.Intermediate
-	case "PaddedIntermediate", "modePaddedIntermediate", "paddedIntermediate", "padded_intermediate":
+	case "PaddedIntermediate":
 		return mode.PaddedIntermediate
 	default:
 		return mode.Abridged
