@@ -3670,6 +3670,25 @@ type eventInfo struct {
 	pattern   string
 }
 
+func normalizePattern(pattern any, defaultEvent EventType) any {
+	switch p := pattern.(type) {
+	case nil:
+		return string(defaultEvent)
+	case string:
+		if p == "" {
+			return string(defaultEvent)
+		}
+		return p
+	case EventType:
+		if p == "" {
+			return string(defaultEvent)
+		}
+		return string(p)
+	default:
+		return pattern
+	}
+}
+
 func parsePattern(pattern any) eventInfo {
 	switch p := pattern.(type) {
 	case string:
@@ -3984,11 +4003,8 @@ func (c *Client) Group(groupID int) *HandlerGroup {
 }
 
 // OnMessage registers a message handler and returns a builder
-func (c *Client) OnMessage(pattern string, handler MessageHandler, filters ...Filter) *MessageHandleBuilder {
-	if pattern == "" {
-		pattern = string(EventNewMessage)
-	}
-	h := c.AddMessageHandler(pattern, handler, filters...)
+func (c *Client) OnMessage(pattern any, handler MessageHandler, filters ...Filter) *MessageHandleBuilder {
+	h := c.AddMessageHandler(normalizePattern(pattern, EventNewMessage), handler, filters...)
 
 	if mh, ok := h.(*messageHandle); ok {
 		return &MessageHandleBuilder{
@@ -4014,11 +4030,8 @@ func (c *Client) OnCommand(command string, handler MessageHandler, filters ...Fi
 }
 
 // OnCallback registers a callback handler and returns a builder
-func (c *Client) OnCallback(pattern string, handler CallbackHandler, filters ...Filter) *CallbackHandleBuilder {
-	if pattern == "" {
-		pattern = string(EventCallbackQuery)
-	}
-	h := c.AddCallbackHandler(pattern, handler, filters...)
+func (c *Client) OnCallback(pattern any, handler CallbackHandler, filters ...Filter) *CallbackHandleBuilder {
+	h := c.AddCallbackHandler(normalizePattern(pattern, EventCallbackQuery), handler, filters...)
 	if cb, ok := h.(*callbackHandle); ok {
 		return &CallbackHandleBuilder{
 			handle:     cb,
@@ -4030,35 +4043,23 @@ func (c *Client) OnCallback(pattern string, handler CallbackHandler, filters ...
 }
 
 // OnInlineQuery registers an inline query handler and returns a handle
-func (c *Client) OnInlineQuery(pattern string, handler func(m *InlineQuery) error) Handle {
-	if pattern == "" {
-		pattern = string(EventInlineQuery)
-	}
-	return c.AddInlineHandler(pattern, handler)
+func (c *Client) OnInlineQuery(pattern any, handler func(m *InlineQuery) error) Handle {
+	return c.AddInlineHandler(normalizePattern(pattern, EventInlineQuery), handler)
 }
 
 // OnInlineCallback registers an inline callback handler and returns a handle
-func (c *Client) OnInlineCallback(pattern string, handler func(m *InlineCallbackQuery) error) Handle {
-	if pattern == "" {
-		pattern = string(EventInlineCallback)
-	}
-	return c.AddInlineCallbackHandler(pattern, handler)
+func (c *Client) OnInlineCallback(pattern any, handler func(m *InlineCallbackQuery) error) Handle {
+	return c.AddInlineCallbackHandler(normalizePattern(pattern, EventInlineCallback), handler)
 }
 
 // OnEdit registers an edit handler and returns a handle
-func (c *Client) OnEdit(pattern string, handler func(m *NewMessage) error, filters ...Filter) Handle {
-	if pattern == "" {
-		pattern = string(EventEditMessage)
-	}
-	return c.AddEditHandler(pattern, handler, filters...)
+func (c *Client) OnEdit(pattern any, handler func(m *NewMessage) error, filters ...Filter) Handle {
+	return c.AddEditHandler(normalizePattern(pattern, EventEditMessage), handler, filters...)
 }
 
 // OnDelete registers a delete handler and returns a handle
-func (c *Client) OnDelete(pattern string, handler func(m *DeleteMessage) error) Handle {
-	if pattern == "" {
-		pattern = string(EventDeleteMessage)
-	}
-	return c.AddDeleteHandler(pattern, handler)
+func (c *Client) OnDelete(pattern any, handler func(m *DeleteMessage) error) Handle {
+	return c.AddDeleteHandler(normalizePattern(pattern, EventDeleteMessage), handler)
 }
 
 // OnAlbum registers an album handler and returns a handle

@@ -131,6 +131,7 @@ type MTProto struct {
 	authKey404Count atomic.Int64
 	authKey404Time  atomic.Int64
 	IpV6            bool
+	obfuscated      bool
 
 	Logger *utils.Logger
 
@@ -183,6 +184,7 @@ type Config struct {
 	Timeout        int            // TCP connection timeout (seconds)
 	ReqTimeout     int            // RPC request timeout (seconds)
 	Transport      TransportType  // Transport variant (default TransportTCP)
+	Obfuscated     bool           // Wrap the TCP transport with obfuscation (mtproto obfuscated2)
 	HTTPPath       string         // HTTP request path (default "/api"; only used for HTTP/HTTPS)
 	PFSKeyLifetime int32          // Lifetime (seconds) for temp auth keys when EnablePFS is set; 0 = 24h
 
@@ -247,6 +249,7 @@ func NewMTProto(c Config) (*MTProto, error) {
 		reqTimeout:            utils.MinSafeDuration(c.ReqTimeout),
 		mode:                  parseTransportMode(c.Mode),
 		IpV6:                  c.Ipv6,
+		obfuscated:            c.Obfuscated,
 		tcpState:              NewTcpState(),
 		DcList:                utils.NewDCOptions(),
 		connConfig: ReconnectConfig{
@@ -299,13 +302,13 @@ func NewMTProto(c Config) (*MTProto, error) {
 
 func parseTransportMode(sMode string) mode.Variant {
 	switch sMode {
-	case "modeAbridged":
+	case "Abridged", "modeAbridged", "abridged", "":
 		return mode.Abridged
-	case "modeFull":
+	case "Full", "modeFull", "full":
 		return mode.Full
-	case "modeIntermediate":
+	case "Intermediate", "modeIntermediate", "intermediate":
 		return mode.Intermediate
-	case "modePaddedIntermediate":
+	case "PaddedIntermediate", "modePaddedIntermediate", "paddedIntermediate", "padded_intermediate":
 		return mode.PaddedIntermediate
 	default:
 		return mode.Abridged
@@ -547,6 +550,7 @@ func (m *MTProto) ExportNewSender(dcID int, mem bool, cdn ...bool) (*MTProto, er
 		Timeout:        int(m.connConfig.Timeout.Seconds()),
 		ReqTimeout:     int(m.reqTimeout.Seconds()),
 		Transport:      m.txType,
+		Obfuscated:     m.obfuscated,
 		HTTPPath:       m.httpPath,
 		EnablePFS:      m.enablePFS,
 		PFSKeyLifetime: m.pfsKeyLifetime,
@@ -734,6 +738,7 @@ func (m *MTProto) connect(ctx context.Context) error {
 		newTransport, err = transport.NewTransport(m, transport.TCPConnConfig{
 			CommonConfig: cfg,
 			IpV6:         m.IpV6,
+			Obfuscated:   m.obfuscated,
 		}, m.mode)
 	}
 

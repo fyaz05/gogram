@@ -99,6 +99,15 @@ const (
 	TransportHTTPS        = mtproto.TransportHTTPS
 )
 
+type TransportMode string
+
+const (
+	TransportModeAbridged           TransportMode = "Abridged"
+	TransportModeIntermediate       TransportMode = "Intermediate"
+	TransportModePaddedIntermediate TransportMode = "PaddedIntermediate"
+	TransportModeFull               TransportMode = "Full"
+)
+
 type ClientConfig struct {
 	AppID            int32                // Telegram API ID from my.telegram.org
 	AppHash          string               // Telegram API Hash from my.telegram.org
@@ -123,7 +132,7 @@ type ClientConfig struct {
 	NoPreconnect     bool                 // Delay connection until Connect() is called
 	Cache            *CACHE               // Custom cache instance
 	CacheSenders     bool                 // Cache exported senders for file operations
-	TransportMode    string               // Wire protocol: "Abridged", "Intermediate", "Full", "PaddedIntermediate"
+	TransportMode    TransportMode        // Wire protocol framing mode; defaults to TransportModeAbridged
 	SleepThresholdMs int                  // Auto-sleep threshold for flood wait (ms)
 	AlbumWaitTime    int64                // Time to wait for grouped album messages (ms)
 	CommandPrefixes  string               // Bot command prefixes (default: "/!")
@@ -132,6 +141,7 @@ type ClientConfig struct {
 	Timeout          int                  // TCP connection timeout in seconds (default: 60)
 	ReqTimeout       int                  // RPC request timeout in seconds (default: 60)
 	Transport        TransportType        // Transport variant (TCP, WebSocket, HTTP, etc.) — default TCP
+	Obfuscated       bool                 // Wrap TCP transport with mtproto obfuscation (only meaningful for TransportTCP)
 	HTTPPath         string               // HTTP request path (default "/api"; only used for HTTP/HTTPS)
 	EnablePFS        bool                 // Enable Perfect Forward Secrecy with temp auth keys
 	PFSKeyLifetime   int32                // Lifetime (seconds) for PFS temp key; 0 = 24h
@@ -221,6 +231,8 @@ func (c *Client) setupMTProto(config ClientConfig) error {
 		Timeout:         config.Timeout,
 		ReqTimeout:      config.ReqTimeout,
 		Transport:       config.Transport,
+		Mode:            string(config.TransportMode),
+		Obfuscated:      config.Obfuscated,
 		HTTPPath:        config.HTTPPath,
 		EnablePFS:       config.EnablePFS,
 		PFSKeyLifetime:  config.PFSKeyLifetime,
@@ -1073,7 +1085,7 @@ func NewClientConfigBuilder(appID int32, appHash string) *ClientConfigBuilder {
 			DataCenter:    4,          // Default DC
 			ParseMode:     "HTML",     // Default parse mode
 			LogLevel:      InfoLevel,  // Default log level
-			TransportMode: "Abridged", // Default transport mode
+			TransportMode: TransportModeAbridged,
 		},
 	}
 }
@@ -1188,7 +1200,7 @@ func (b *ClientConfigBuilder) WithSessionName(name string) *ClientConfigBuilder 
 	return b
 }
 
-func (b *ClientConfigBuilder) WithTransportMode(mode string) *ClientConfigBuilder {
+func (b *ClientConfigBuilder) WithTransportMode(mode TransportMode) *ClientConfigBuilder {
 	b.config.TransportMode = mode
 	return b
 }
