@@ -145,6 +145,8 @@ type MTProto struct {
 	cdn                   bool
 	terminated            atomic.Bool
 	disconnected          atomic.Bool
+	shutdownCh            chan struct{}
+	shutdownMu            sync.Mutex
 	senderCounters        sync.Map // map[int]int32 - tracks sender count per DC
 
 	connConfig ReconnectConfig
@@ -254,6 +256,7 @@ func NewMTProto(c Config) (*MTProto, error) {
 		IpV6:                  c.Ipv6,
 		obfuscated:            c.Obfuscated,
 		tcpState:              NewTcpState(),
+		shutdownCh:            make(chan struct{}),
 		DcList:                utils.NewDCOptions(),
 		connConfig: ReconnectConfig{
 			Timeout:     utils.MinSafeDuration(c.Timeout),
@@ -640,7 +643,9 @@ func (m *MTProto) CreateConnection(withLog bool) error {
 	if m.terminated.Load() {
 		return fmt.Errorf("mtproto is terminated, cannot create connection")
 	}
-	m.disconnected.Store(false)
+	if m.disconnected.Load() {
+		return fmt.Errorf("mtproto is disconnected")
+	}
 	m.stopRoutines()
 	m.routineswg.Wait()
 
@@ -887,6 +892,10 @@ func (m *MTProto) makeRequestCtxWithDepth(ctx context.Context, data tl.Object, r
 		return nil, fmt.Errorf("maximum retry depth exceeded (%d) - aborting request", m.maxRetryDepth)
 	}
 
+	if m.terminated.Load() || m.disconnected.Load() {
+		return nil, errors.New("client is disconnected")
+	}
+
 	if err := m.tcpState.WaitForActive(ctx); err != nil {
 		if m.shouldRetryError(fmt.Errorf("tcp inactive: %w", err)) && retryDepth < m.maxRetryDepth {
 			m.Logger.Trace("tcp inactive, retrying (depth=%d/%d)", retryDepth+1, m.maxRetryDepth)
@@ -900,6 +909,9 @@ func (m *MTProto) makeRequestCtxWithDepth(ctx context.Context, data tl.Object, r
 	respChan, msgID, err := m.sendPacket(data, expectedTypes...)
 	if err != nil {
 		if utils.IsTransportError(err) {
+			if m.terminated.Load() || m.disconnected.Load() {
+				return nil, fmt.Errorf("transport closed: %w", err)
+			}
 			m.Logger.WithError(err).Trace("transport error for msgID=%d, reconnecting (depth=%d/%d)", msgID, retryDepth, m.maxRetryDepth)
 			if reconnErr := m.Reconnect(false); reconnErr != nil {
 				m.Logger.WithError(reconnErr).Error("reconnect failed after transport error")
@@ -926,7 +938,16 @@ func (m *MTProto) makeRequestCtxWithDepth(ctx context.Context, data tl.Object, r
 		m.Logger.Trace("request sent: %T (msgID=%d, d=%d)", data, msgID, retryDepth)
 	}
 
+	shutdownCh := m.getShutdownCh()
 	select {
+	case <-shutdownCh:
+		if msgID != 0 {
+			m.responseChannels.Delete(int(msgID))
+			m.expectedTypes.Delete(int(msgID))
+			m.messageTracker.Delete(int(msgID))
+			m.messageTypesMap.Delete(msgID)
+		}
+		return nil, errors.New("client is disconnected")
 	case <-ctx.Done():
 		if msgID != 0 {
 			_, channelExists := m.responseChannels.Get(int(msgID))
@@ -1087,11 +1108,14 @@ func (m *MTProto) stopRoutines() {
 
 func (m *MTProto) Disconnect() error {
 	m.disconnected.Store(true)
+	m.signalShutdown()
 	m.tcpState.SetActive(false)
 	m.stopRoutines()
 
 	m.lifecycleMu.Lock()
 	defer m.lifecycleMu.Unlock()
+	m.disconnected.Store(true)
+	m.stopRoutines()
 	m.routineswg.Wait()
 	m.transportMu.Lock()
 	m.transport = nil
@@ -1103,11 +1127,15 @@ func (m *MTProto) Disconnect() error {
 func (m *MTProto) Terminate() error {
 	m.terminated.Store(true)
 	m.disconnected.Store(true)
+	m.signalShutdown()
 	m.tcpState.SetActive(false)
 	m.stopRoutines()
 
 	m.lifecycleMu.Lock()
 	defer m.lifecycleMu.Unlock()
+	m.terminated.Store(true)
+	m.disconnected.Store(true)
+	m.stopRoutines()
 	m.routineswg.Wait()
 	m.responseChannels.Close()
 	m.transportMu.Lock()
@@ -1118,11 +1146,36 @@ func (m *MTProto) Terminate() error {
 
 func (m *MTProto) SetTerminated(val bool) { m.terminated.Store(val) }
 
+func (m *MTProto) getShutdownCh() chan struct{} {
+	m.shutdownMu.Lock()
+	defer m.shutdownMu.Unlock()
+	return m.shutdownCh
+}
+
+func (m *MTProto) signalShutdown() {
+	m.shutdownMu.Lock()
+	defer m.shutdownMu.Unlock()
+	select {
+	case <-m.shutdownCh:
+	default:
+		close(m.shutdownCh)
+	}
+}
+
+func (m *MTProto) resetShutdown() {
+	m.shutdownMu.Lock()
+	defer m.shutdownMu.Unlock()
+	select {
+	case <-m.shutdownCh:
+		m.shutdownCh = make(chan struct{})
+	default:
+	}
+}
+
 func (m *MTProto) Reconnect(loggy bool) error {
 	if m.terminated.Load() {
 		return nil
 	}
-	m.disconnected.Store(false)
 	if !m.connState.InProgress.CompareAndSwap(false, true) {
 		m.Logger.Trace("reconnect already in progress")
 		return nil
@@ -1133,6 +1186,9 @@ func (m *MTProto) Reconnect(loggy bool) error {
 	tx := m.GetTransportType()
 	start := time.Now()
 	m.logReconnect(loggy, "reconnecting to %s (%s)", addr, tx)
+
+	m.disconnected.Store(false)
+	m.resetShutdown()
 
 	if err := m.CreateConnection(loggy); err != nil {
 		m.Logger.WithError(err).Error("failed to recreate connection")

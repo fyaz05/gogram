@@ -456,6 +456,8 @@ func (m *MTProto) bindTempAuthKey(ctx context.Context) error {
 	select {
 	case response = <-respCh:
 	case <-ctx.Done():
+		m.responseChannels.Delete(int(msgID))
+		m.expectedTypes.Delete(int(msgID))
 		m.tempAuthKey = prevTempKey
 		m.tempAuthKeyHash = prevTempHash
 		return ctx.Err()
