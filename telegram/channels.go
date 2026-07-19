@@ -72,6 +72,7 @@ func (c *Client) JoinChannel(channel any) (*Channel, error) {
 					return nil, errJoin
 				}
 				if already, ok := resp.(*ChatInviteAlready); ok {
+					c.Cache.UpdatePeersToCache(nil, []Chat{already.Chat})
 					if chat, ok := already.Chat.(*Channel); ok {
 						return chat, nil
 					}
@@ -113,11 +114,48 @@ func (c *Client) joinChannelByPeer(channel any) (*Channel, error) {
 		return nil, err
 	}
 	if chat, ok := channel.(*InputPeerChannel); ok {
-		_, err = c.ChannelsJoinChannel(&InputChannelObj{ChannelID: chat.ChannelID, AccessHash: chat.AccessHash})
+		result, err := c.ChannelsJoinChannel(&InputChannelObj{ChannelID: chat.ChannelID, AccessHash: chat.AccessHash})
 		if err != nil {
-			return nil, err
+			if !MatchError(err, "USER_ALREADY_PARTICIPANT") {
+				return nil, err
+			}
+
+			channel, err := c.ChannelsGetChannels([]InputChannel{&InputChannelObj{ChannelID: chat.ChannelID, AccessHash: chat.AccessHash}})
+			if err != nil {
+				return nil, err
+			}
+
+			switch ch := channel.(type) {
+			case *MessagesChatsObj:
+				c.Cache.UpdatePeersToCache([]User{}, ch.Chats)
+				if len(ch.Chats) > 0 {
+					if ch, ok := ch.Chats[0].(*Channel); ok {
+						return ch, nil
+					}
+				}
+			case *MessagesChatsSlice:
+				c.Cache.UpdatePeersToCache([]User{}, ch.Chats)
+				if len(ch.Chats) > 0 {
+					if ch, ok := ch.Chats[0].(*Channel); ok {
+						return ch, nil
+					}
+				}
+			}
 		}
-		return c.GetChannel(chat.ChannelID)
+
+		switch res := result.(type) {
+		case *MessagesChatInviteJoinResultOk:
+			if updates, ok := res.Updates.(*UpdatesObj); ok {
+				c.Cache.UpdatePeersToCache(updates.Users, updates.Chats)
+				for _, chat := range updates.Chats {
+					if ch, ok := chat.(*Channel); ok {
+						return ch, nil
+					}
+				}
+			}
+		case *MessagesChatInviteJoinResultWebView:
+			return nil, errors.New("join via webview is not supported")
+		}
 	} else if chat, ok := channel.(*InputPeerChat); ok {
 		_, err = c.MessagesAddChatUser(chat.ChatID, &InputUserEmpty{}, 0)
 		if err != nil {
