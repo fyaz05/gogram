@@ -900,7 +900,7 @@ func (m *MTProto) makeRequestCtxWithDepth(ctx context.Context, data tl.Object, r
 	}
 
 	if m.transport == nil && !m.IsTcpActive() {
-		if err := m.CreateConnection(false); err != nil {
+		if err := m.createConnection(false, false); err != nil {
 			return nil, fmt.Errorf("establishing connection: %w", err)
 		}
 	}

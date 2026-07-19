@@ -156,6 +156,7 @@ func (c *Client) joinChannelByPeer(channel any) (*Channel, error) {
 		case *MessagesChatInviteJoinResultWebView:
 			return nil, errors.New("join via webview is not supported")
 		}
+		return c.GetChannel(chat.ChannelID)
 	} else if chat, ok := channel.(*InputPeerChat); ok {
 		_, err = c.MessagesAddChatUser(chat.ChatID, &InputUserEmpty{}, 0)
 		if err != nil {
