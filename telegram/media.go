@@ -1150,8 +1150,9 @@ func (d *downloadDestination) Close() error {
 type downloadJob struct {
 	client           *Client
 	opts             *DownloadOptions
-	location         InputFileLocation
-	dc               int32
+	location     InputFileLocation
+	locationMu   sync.RWMutex // Protects location from concurrent writes during refetch
+	dc           int32
 	size             int64
 	knownSize        bool
 	partSize         int
@@ -1168,6 +1169,8 @@ type downloadJob struct {
 	cdnPools map[int32]*WorkerPool
 
 	throttle *byteThrottle
+
+	refetchCount int          // Limits refetch retries to prevent infinite recursion
 
 	resume       *resumeState
 	resumeStopCh chan struct{}
@@ -1541,14 +1544,24 @@ func (j *downloadJob) fetchPartLoop(ctx context.Context, pool *WorkerPool, part 
 		}
 		lastErr = err
 		if strings.Contains(err.Error(), "FILE_REFERENCE_EXPIRED") && j.opts.RefetchFileReference != nil {
-			j.client.Log.Info("File reference expired. Attempting to auto-refresh...")
-			newMedia, refetchErr := j.opts.RefetchFileReference()
-			if refetchErr == nil {
-				newInput, _, _, _, locationErr := GetFileLocation(newMedia)
-				if locationErr == nil {
-					j.location = newInput
-					// Retry the current part download with the refreshed file reference
-					return j.fetchPartLoop(ctx, pool, part)
+			j.locationMu.Lock()
+			canRefetch := j.refetchCount < 2
+			if canRefetch {
+				j.refetchCount++
+			}
+			j.locationMu.Unlock()
+			if canRefetch {
+				j.client.Log.Info("File reference expired. Attempting to auto-refresh...")
+				newMedia, refetchErr := j.opts.RefetchFileReference()
+				if refetchErr == nil {
+					newInput, _, _, _, locationErr := GetFileLocation(newMedia)
+					if locationErr == nil {
+						j.locationMu.Lock()
+						j.location = newInput
+						j.locationMu.Unlock()
+						// Retry this part
+						return j.fetchPartLoop(ctx, pool, part)
+					}
 				}
 			}
 		}
@@ -1743,11 +1756,15 @@ func decryptCDNBlock(data, key, iv []byte, offset int64) {
 }
 
 func (j *downloadJob) makeGetFileRequest(part downloadRange) tl.Object {
+	j.locationMu.RLock()
+	loc := j.location
+	j.locationMu.RUnlock()
+
 	request := tl.Object(&UploadGetFileParams{
-		Location:     j.location,
+		Precise:      false,
+		Location:     loc,
 		Offset:       part.offset,
 		Limit:        int32(part.limit),
-		Precise:      false,
 		CdnSupported: true,
 	})
 	if j.opts.TakeoutID != 0 {
@@ -1947,7 +1964,8 @@ func initializeWorkersWithMode(numWorkers int, dc int32, c *Client, w *WorkerPoo
 
 // DownloadChunkCtx downloads a specific range of file bytes. It supports a context
 // for handling request cancellation and timeouts gracefully.
-func (c *Client) DownloadChunkCtx(ctx context.Context, media any, start int, end int, chunkSize int) ([]byte, string, error) {
+// It auto-aligns start and end offsets to satisfy Telegram's MTProto alignment constraints.
+func (c *Client) DownloadChunkCtx(ctx context.Context, media any, start int, end int, chunkSize int, opts ...*DownloadOptions) ([]byte, string, error) {
 	if err := validateDownloadChunkSize(chunkSize); err != nil {
 		return nil, "", err
 	}
@@ -1970,9 +1988,22 @@ func (c *Client) DownloadChunkCtx(ctx context.Context, media any, start int, end
 		end = int(size)
 	}
 
+	// Telegram requires start offset to be aligned to 1024 bytes.
+	// We align start down to the nearest multiple of chunkSize (which is a multiple of 4096).
+	alignedStart := (start / chunkSize) * chunkSize
+	skip := start - alignedStart
+	contentLength := end - start
+
+	var options *DownloadOptions
+	if len(opts) > 0 && opts[0] != nil {
+		options = opts[0]
+	} else {
+		options = &DownloadOptions{}
+	}
+
 	job := &downloadJob{
 		client:    c,
-		opts:      &DownloadOptions{},
+		opts:      options,
 		location:  input,
 		dc:        dc,
 		size:      size,
@@ -1994,10 +2025,14 @@ func (c *Client) DownloadChunkCtx(ctx context.Context, media any, start int, end
 	}
 
 	var buf []byte
-	for index, offset := 0, int64(start); offset < int64(end); index++ {
+	for index, offset := 0, int64(alignedStart); offset < int64(end); index++ {
 		limit := chunkSize
 		if remaining := int64(end) - offset; remaining < int64(limit) {
 			limit = int(remaining)
+			// Round limit up to nearest 4096-byte multiple for Telegram compatibility
+			if limit%4096 != 0 {
+				limit = ((limit / 4096) + 1) * 4096
+			}
 		}
 		result, err := job.fetchPartLoop(job.ctx, pool, downloadRange{index: index, offset: offset, limit: limit})
 		if err != nil {
@@ -2011,9 +2046,19 @@ func (c *Client) DownloadChunkCtx(ctx context.Context, media any, start int, end
 		n := len(result.data)
 		tl.ReleaseLargeBuffer(result.data)
 		offset += int64(n)
-		if n < limit {
+		if n < int64(limit) {
 			break
 		}
+	}
+
+	// Trim prefix skip and suffix extra bytes locally
+	if len(buf) > skip {
+		buf = buf[skip:]
+	} else {
+		buf = []byte{}
+	}
+	if len(buf) > contentLength {
+		buf = buf[:contentLength]
 	}
 
 	return buf, name, nil
