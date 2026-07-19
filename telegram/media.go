@@ -1150,9 +1150,9 @@ func (d *downloadDestination) Close() error {
 type downloadJob struct {
 	client           *Client
 	opts             *DownloadOptions
-	location     InputFileLocation
-	locationMu   sync.RWMutex // Protects location from concurrent writes during refetch
-	dc           int32
+	location         InputFileLocation
+	locationMu       sync.RWMutex // Protects location from concurrent writes during refetch
+	dc               int32
 	size             int64
 	knownSize        bool
 	partSize         int
@@ -1170,7 +1170,7 @@ type downloadJob struct {
 
 	throttle *byteThrottle
 
-	refetchCount int          // Limits refetch retries to prevent infinite recursion
+	refetchCount int // Limits refetch retries to prevent infinite recursion
 
 	resume       *resumeState
 	resumeStopCh chan struct{}
@@ -1962,9 +1962,14 @@ func initializeWorkersWithMode(numWorkers int, dc int32, c *Client, w *WorkerPoo
 	return nil
 }
 
-// DownloadChunkCtx downloads a specific range of file bytes. It supports a context
-// for handling request cancellation and timeouts gracefully.
-// It auto-aligns start and end offsets to satisfy Telegram's MTProto alignment constraints.
+// DownloadChunkCtx downloads a byte range [start, end) of media. The context
+// is respected for cancellation and timeouts. Chunk size must be a divisor of
+// 1 MB and a multiple of 4096 (Telegram's upload.getFile alignment).
+//
+// Callers may pass arbitrary byte offsets; each fetch is aligned to a 4096
+// boundary and the excess is trimmed per-iteration to avoid buffering bytes
+// the caller did not request. An optional *DownloadOptions can be supplied
+// to enable RefetchFileReference on FILE_REFERENCE_EXPIRED.
 func (c *Client) DownloadChunkCtx(ctx context.Context, media any, start int, end int, chunkSize int, opts ...*DownloadOptions) ([]byte, string, error) {
 	if err := validateDownloadChunkSize(chunkSize); err != nil {
 		return nil, "", err
@@ -1988,11 +1993,7 @@ func (c *Client) DownloadChunkCtx(ctx context.Context, media any, start int, end
 		end = int(size)
 	}
 
-	// Telegram requires start offset to be aligned to 1024 bytes.
-	// We align start down to the nearest multiple of chunkSize (which is a multiple of 4096).
-	alignedStart := (start / chunkSize) * chunkSize
-	skip := start - alignedStart
-	contentLength := end - start
+	contentLength := int64(end - start)
 
 	var options *DownloadOptions
 	if len(opts) > 0 && opts[0] != nil {
@@ -2024,17 +2025,26 @@ func (c *Client) DownloadChunkCtx(ctx context.Context, media any, start int, end
 		return nil, "", errors.New("failed to initialize worker")
 	}
 
-	var buf []byte
-	for index, offset := 0, int64(alignedStart); offset < int64(end); index++ {
+	buf := make([]byte, 0, contentLength)
+	written := int64(0)
+	for index, offset := 0, int64(start); offset < int64(end) && written < contentLength; index++ {
+		// Telegram requires upload.getFile offset to be a multiple of 4096
+		// and limit to be a multiple of 4096. Align both, then trim locally.
+		alignedOffset := offset &^ 4095
+		skip := offset - alignedOffset
+
 		limit := chunkSize
 		if remaining := int64(end) - offset; remaining < int64(limit) {
 			limit = int(remaining)
-			// Round limit up to nearest 4096-byte multiple for Telegram compatibility
-			if limit%4096 != 0 {
-				limit = ((limit / 4096) + 1) * 4096
-			}
 		}
-		result, err := job.fetchPartLoop(job.ctx, pool, downloadRange{index: index, offset: offset, limit: limit})
+		if r := limit % 4096; r != 0 {
+			limit += 4096 - r
+		}
+		if limit > chunkSize {
+			limit = chunkSize
+		}
+
+		result, err := job.fetchPartLoop(job.ctx, pool, downloadRange{index: index, offset: alignedOffset, limit: limit})
 		if err != nil {
 			return nil, "", err
 		}
@@ -2042,23 +2052,30 @@ func (c *Client) DownloadChunkCtx(ctx context.Context, media any, start int, end
 			tl.ReleaseLargeBuffer(result.data)
 			break
 		}
-		buf = append(buf, result.data...)
-		n := len(result.data)
+
+		data := result.data
+		// Drop leading bytes that precede the requested offset.
+		if skip > 0 {
+			if int64(skip) >= int64(len(data)) {
+				tl.ReleaseLargeBuffer(result.data)
+				offset += int64(len(data))
+				continue
+			}
+			data = data[skip:]
+		}
+		// Drop trailing bytes that exceed the requested range.
+		if remaining := contentLength - written; int64(len(data)) > remaining {
+			data = data[:remaining]
+		}
+
+		buf = append(buf, data...)
+		n := len(data)
 		tl.ReleaseLargeBuffer(result.data)
-		offset += int64(n)
-		if n < int64(limit) {
+		offset += int64(n) + skip
+		written += int64(n)
+		if n+int(skip) < limit { // short read = EOF
 			break
 		}
-	}
-
-	// Trim prefix skip and suffix extra bytes locally
-	if len(buf) > skip {
-		buf = buf[skip:]
-	} else {
-		buf = []byte{}
-	}
-	if len(buf) > contentLength {
-		buf = buf[:contentLength]
 	}
 
 	return buf, name, nil
