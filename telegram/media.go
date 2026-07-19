@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2025 @AmarnathCJD
+// Copyright (c) 2025 @AmarnathCJD
 
 package telegram
 
@@ -1029,6 +1029,10 @@ type DownloadOptions struct {
 	// Resume picks up an interrupted download from a sidecar <dest>.partstate
 	// file. Only supported for known-size file downloads (Buffer == nil).
 	Resume bool
+
+	// RefetchFileReference is called if a FILE_REFERENCE_EXPIRED error occurs mid-stream.
+	// It must return the newly-fetched MessageMedia object.
+	RefetchFileReference func() (any, error)
 }
 
 type downloadErrKind int
@@ -1356,10 +1360,21 @@ func (c *Client) newDownloadJob(file any, opts *DownloadOptions) (*downloadJob, 
 }
 
 func validateDownloadChunkSize(size int) error {
+
 	if size <= 0 || size > 1048576 || 1048576%size != 0 {
+
 		return errors.New("chunk size must be a divisor of 1048576 (1MB)")
+
 	}
+
+	if size%4096 != 0 {
+
+		return errors.New("chunk size must be a multiple of 4096")
+
+	}
+
 	return nil
+
 }
 
 func (j *downloadJob) run() error {
@@ -1525,6 +1540,18 @@ func (j *downloadJob) fetchPartLoop(ctx context.Context, pool *WorkerPool, part 
 			return result, nil
 		}
 		lastErr = err
+		if strings.Contains(err.Error(), "FILE_REFERENCE_EXPIRED") && j.opts.RefetchFileReference != nil {
+			j.client.Log.Info("File reference expired. Attempting to auto-refresh...")
+			newMedia, refetchErr := j.opts.RefetchFileReference()
+			if refetchErr == nil {
+				newInput, _, _, _, locationErr := GetFileLocation(newMedia)
+				if locationErr == nil {
+					j.location = newInput
+					// Retry the current part download with the refreshed file reference
+					return j.fetchPartLoop(ctx, pool, part)
+				}
+			}
+		}
 		failure := j.classifyError(ctx, err)
 		if failure.kind == downloadErrFatal || failure.kind == downloadErrContext {
 			return downloadResult{}, failure.err
@@ -1752,6 +1779,7 @@ func (j *downloadJob) classifyError(ctx context.Context, err error) downloadFail
 		"FILE_REFERENCE_INVALID",
 		"TAKEOUT_INVALID",
 		"LOCATION_INVALID",
+		"LIMIT_INVALID",
 		"OFFSET_INVALID",
 		"FILE_ID_INVALID",
 		"AUTH_BYTES_INVALID",
@@ -1917,13 +1945,9 @@ func initializeWorkersWithMode(numWorkers int, dc int32, c *Client, w *WorkerPoo
 	return nil
 }
 
-// DownloadChunk downloads a file in chunks, useful for downloading specific parts of a file.
-//
-// start and end are the byte offsets to download.
-// chunkSize is the size of each chunk to download.
-//
-// Note: chunkSize must be a multiple of 1048576 (1MB)
-func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int) ([]byte, string, error) {
+// DownloadChunkCtx downloads a specific range of file bytes. It supports a context
+// for handling request cancellation and timeouts gracefully.
+func (c *Client) DownloadChunkCtx(ctx context.Context, media any, start int, end int, chunkSize int) ([]byte, string, error) {
 	if err := validateDownloadChunkSize(chunkSize); err != nil {
 		return nil, "", err
 	}
@@ -1955,7 +1979,7 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int) ([]
 		knownSize: size > 0,
 		partSize:  chunkSize,
 		workers:   1,
-		ctx:       context.Background(),
+		ctx:       ctx,
 		log:       newPartLogAggregator("download_chunk", 0, 3*time.Second, c.Log),
 	}
 	defer job.log.Flush()
@@ -1993,6 +2017,13 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int) ([]
 	}
 
 	return buf, name, nil
+}
+
+// DownloadChunk downloads a specific range of file bytes.
+//
+// Deprecated: Use DownloadChunkCtx instead to prevent hanging connections on client disconnects.
+func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int) ([]byte, string, error) {
+	return c.DownloadChunkCtx(context.Background(), media, start, end, chunkSize)
 }
 
 // ----------------------- Helper Functions -----------------------
