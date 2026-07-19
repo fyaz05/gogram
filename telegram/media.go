@@ -1170,8 +1170,6 @@ type downloadJob struct {
 
 	throttle *byteThrottle
 
-	refetchCount int // Limits refetch retries to prevent infinite recursion
-
 	resume       *resumeState
 	resumeStopCh chan struct{}
 }
@@ -1531,46 +1529,56 @@ func (j *downloadJob) runUnknownSize() error {
 	}
 }
 
+// refreshFileReference re-fetches the media location via the caller's
+// RefetchFileReference callback. Returns true if j.location was updated.
+func (j *downloadJob) refreshFileReference() bool {
+	if j.opts.RefetchFileReference == nil {
+		return false
+	}
+	newMedia, refetchErr := j.opts.RefetchFileReference()
+	if refetchErr != nil {
+		return false
+	}
+	newInput, _, _, _, locationErr := GetFileLocation(newMedia)
+	if locationErr != nil {
+		return false
+	}
+	j.locationMu.Lock()
+	j.location = newInput
+	j.locationMu.Unlock()
+	return true
+}
+
 func (j *downloadJob) fetchPartLoop(ctx context.Context, pool *WorkerPool, part downloadRange) (downloadResult, error) {
 	const maxAttempts = 20
+	const maxRefetches = 2
 	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		result, err := j.fetchPart(ctx, pool, part, attempt)
-		if err == nil {
-			if j.throttle != nil {
-				j.throttle.wait(len(result.data))
-			}
-			return result, nil
-		}
-		lastErr = err
-		if strings.Contains(err.Error(), "FILE_REFERENCE_EXPIRED") && j.opts.RefetchFileReference != nil {
-			j.locationMu.Lock()
-			canRefetch := j.refetchCount < 2
-			if canRefetch {
-				j.refetchCount++
-			}
-			j.locationMu.Unlock()
-			if canRefetch {
-				j.client.Log.Info("File reference expired. Attempting to auto-refresh...")
-				newMedia, refetchErr := j.opts.RefetchFileReference()
-				if refetchErr == nil {
-					newInput, _, _, _, locationErr := GetFileLocation(newMedia)
-					if locationErr == nil {
-						j.locationMu.Lock()
-						j.location = newInput
-						j.locationMu.Unlock()
-						// Retry this part
-						return j.fetchPartLoop(ctx, pool, part)
-					}
+	for refetch := 0; refetch <= maxRefetches; refetch++ {
+		for attempt := 0; attempt < maxAttempts; attempt++ {
+			result, err := j.fetchPart(ctx, pool, part, attempt)
+			if err == nil {
+				if j.throttle != nil {
+					j.throttle.wait(len(result.data))
 				}
+				return result, nil
 			}
-		}
-		failure := j.classifyError(ctx, err)
-		if failure.kind == downloadErrFatal || failure.kind == downloadErrContext {
-			return downloadResult{}, failure.err
-		}
-		if err := j.sleepRetry(ctx, failure, attempt); err != nil {
-			return downloadResult{}, err
+			lastErr = err
+
+			failure := j.classifyError(ctx, err)
+			if failure.kind == downloadErrFatal || failure.kind == downloadErrContext {
+				return downloadResult{}, failure.err
+			}
+
+			// On FILE_REFERENCE_EXPIRED, refresh the location and restart
+			// the attempt loop. Bounded by maxRefetches.
+			if strings.Contains(err.Error(), "FILE_REFERENCE_EXPIRED") && refetch < maxRefetches && j.refreshFileReference() {
+				j.client.Log.Info("file reference refreshed; retrying", "refetch", refetch+1)
+				break
+			}
+
+			if sleepErr := j.sleepRetry(ctx, failure, attempt); sleepErr != nil {
+				return downloadResult{}, sleepErr
+			}
 		}
 	}
 	return downloadResult{}, fmt.Errorf("part %d failed after %d attempts: %w", part.index, maxAttempts, lastErr)
@@ -1993,27 +2001,7 @@ func (c *Client) DownloadChunkCtx(ctx context.Context, media any, start int, end
 		end = int(size)
 	}
 
-	contentLength := int64(end - start)
-
-	var options *DownloadOptions
-	if len(opts) > 0 && opts[0] != nil {
-		options = opts[0]
-	} else {
-		options = &DownloadOptions{}
-	}
-
-	job := &downloadJob{
-		client:    c,
-		opts:      options,
-		location:  input,
-		dc:        dc,
-		size:      size,
-		knownSize: size > 0,
-		partSize:  chunkSize,
-		workers:   1,
-		ctx:       ctx,
-		log:       newPartLogAggregator("download_chunk", 0, 3*time.Second, c.Log),
-	}
+	job := c.newChunkDownloadJob(ctx, input, dc, size, chunkSize, opts)
 	defer job.log.Flush()
 
 	pool := NewWorkerPool(1)
@@ -2025,24 +2013,40 @@ func (c *Client) DownloadChunkCtx(ctx context.Context, media any, start int, end
 		return nil, "", errors.New("failed to initialize worker")
 	}
 
+	return c.downloadRangeAligned(job, pool, int64(start), int64(end), int64(chunkSize), name)
+}
+
+// newChunkDownloadJob builds a downloadJob for DownloadChunkCtx, honoring the
+// optional DownloadOptions (currently only RefetchFileReference is used).
+func (c *Client) newChunkDownloadJob(ctx context.Context, input InputFileLocation, dc int32, size int64, chunkSize int, opts []*DownloadOptions) *downloadJob {
+	options := &DownloadOptions{}
+	if len(opts) > 0 && opts[0] != nil {
+		options = opts[0]
+	}
+	return &downloadJob{
+		client:    c,
+		opts:      options,
+		location:  input,
+		dc:        dc,
+		size:      size,
+		knownSize: size > 0,
+		partSize:  chunkSize,
+		workers:   1,
+		ctx:       ctx,
+		log:       newPartLogAggregator("download_chunk", 0, 3*time.Second, c.Log),
+	}
+}
+
+// downloadRangeAligned fetches [start, end) from the job in 4096-aligned
+// chunks, trimming over-fetched bytes per-iteration. Returns the assembled
+// buffer and the file name.
+func (c *Client) downloadRangeAligned(job *downloadJob, pool *WorkerPool, start, end, chunkSize int64, name string) ([]byte, string, error) {
+	contentLength := end - start
 	buf := make([]byte, 0, contentLength)
 	written := int64(0)
-	for index, offset := 0, int64(start); offset < int64(end) && written < contentLength; index++ {
-		// Telegram requires upload.getFile offset to be a multiple of 4096
-		// and limit to be a multiple of 4096. Align both, then trim locally.
-		alignedOffset := offset &^ 4095
-		skip := offset - alignedOffset
 
-		limit := chunkSize
-		if remaining := int64(end) - offset; remaining < int64(limit) {
-			limit = int(remaining)
-		}
-		if r := limit % 4096; r != 0 {
-			limit += 4096 - r
-		}
-		if limit > chunkSize {
-			limit = chunkSize
-		}
+	for index, offset := 0, start; offset < end && written < contentLength; index++ {
+		alignedOffset, skip, limit := alignedFetchRange(offset, end, chunkSize)
 
 		result, err := job.fetchPartLoop(job.ctx, pool, downloadRange{index: index, offset: alignedOffset, limit: limit})
 		if err != nil {
@@ -2053,32 +2057,66 @@ func (c *Client) DownloadChunkCtx(ctx context.Context, media any, start int, end
 			break
 		}
 
-		data := result.data
-		// Drop leading bytes that precede the requested offset.
-		if skip > 0 {
-			if int64(skip) >= int64(len(data)) {
-				tl.ReleaseLargeBuffer(result.data)
-				offset += int64(len(data))
-				continue
-			}
-			data = data[skip:]
+		data, eof := trimChunk(result.data, int64(skip), int64(limit), contentLength-written)
+		if data == nil {
+			// Entire chunk fell before the requested offset.
+			tl.ReleaseLargeBuffer(result.data)
+			offset += int64(len(result.data))
+			continue
 		}
-		// Drop trailing bytes that exceed the requested range.
-		if remaining := contentLength - written; int64(len(data)) > remaining {
-			data = data[:remaining]
-		}
-
 		buf = append(buf, data...)
-		n := len(data)
 		tl.ReleaseLargeBuffer(result.data)
-		offset += int64(n) + skip
-		written += int64(n)
-		if n+int(skip) < limit { // short read = EOF
+		offset += int64(len(result.data))
+		written += int64(len(data))
+		if eof {
 			break
 		}
 	}
 
 	return buf, name, nil
+}
+
+// trimChunk trims the fetched bytes to the requested [offset, end) window.
+// skip is the number of leading bytes to drop (because the fetch was aligned
+// to a 4096 boundary before offset). limit is the wire-aligned limit that was
+// requested. remaining is the number of bytes still needed by the caller.
+// Returns the trimmed data and a flag indicating a short read (which signals
+// EOF — Telegram returns fewer bytes than requested only at end-of-file).
+func trimChunk(data []byte, skip, limit, remaining int64) (trimmed []byte, eof bool) {
+	if skip > 0 {
+		if skip >= int64(len(data)) {
+			return nil, false
+		}
+		data = data[skip:]
+	}
+	if int64(len(data)) > remaining {
+		data = data[:remaining]
+	}
+	// eof = the underlying fetch returned fewer bytes than the aligned limit.
+	eof = int64(len(data))+skip < limit
+	return data, eof
+}
+
+// alignedFetchRange computes the wire-aligned offset, the number of leading
+// bytes to skip, and the aligned limit for a single upload.getFile request
+// covering the requested [offset, end) window. chunkSize must already be a
+// multiple of 4096 (enforced by validateDownloadChunkSize).
+func alignedFetchRange(offset, end, chunkSize int64) (alignedOffset int64, skip, limit int) {
+	alignedOffset = offset &^ 4095 // round down to nearest 4096
+	skip = int(offset - alignedOffset)
+
+	rawLimit := chunkSize
+	if remaining := end - offset; remaining < rawLimit {
+		rawLimit = remaining
+	}
+	limit = int(rawLimit)
+	if r := limit % 4096; r != 0 { // round up to nearest 4096
+		limit += 4096 - r
+	}
+	if int64(limit) > chunkSize {
+		limit = int(chunkSize)
+	}
+	return alignedOffset, skip, limit
 }
 
 // DownloadChunk downloads a specific range of file bytes.
