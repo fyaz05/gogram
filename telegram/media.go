@@ -8,6 +8,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -1030,8 +1031,8 @@ type DownloadOptions struct {
 	// file. Only supported for known-size file downloads (Buffer == nil).
 	Resume bool
 
-	// RefetchFileReference is called if a FILE_REFERENCE_EXPIRED error occurs mid-stream.
-	// It must return the newly-fetched MessageMedia object.
+	// RefetchFileReference is called for a refreshable FILE_REFERENCE_* error
+	// mid-stream. It must return the newly-fetched MessageMedia object.
 	RefetchFileReference func() (any, error)
 }
 
@@ -1124,19 +1125,26 @@ func (d *downloadDestination) displayName() string {
 }
 
 func (d *downloadDestination) WriteAt(p []byte, off int64) (int, error) {
+	var (
+		n   int
+		err error
+	)
 	if d.file != nil {
-		return d.file.WriteAt(p, off)
+		n, err = d.file.WriteAt(p, off)
+	} else if d.writerAt != nil {
+		n, err = d.writerAt.WriteAt(p, off)
+	} else {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if off != d.written {
+			return 0, fmt.Errorf("sequential writer received offset %d after %d bytes", off, d.written)
+		}
+		n, err = d.writer.Write(p)
+		d.written += int64(n)
 	}
-	if d.writerAt != nil {
-		return d.writerAt.WriteAt(p, off)
+	if n != len(p) && err == nil {
+		err = io.ErrShortWrite
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if off != d.written {
-		return 0, fmt.Errorf("sequential writer received offset %d after %d bytes", off, d.written)
-	}
-	n, err := d.writer.Write(p)
-	d.written += int64(n)
 	return n, err
 }
 
@@ -1164,9 +1172,10 @@ type downloadJob struct {
 	progressTracker  *progressTracker
 	log              *partLogAggregator
 
-	cdnMu    sync.Mutex
-	cdn      *cdnRedirect
-	cdnPools map[int32]*WorkerPool
+	cdnMu      sync.Mutex
+	cdn        *cdnRedirect
+	cdnPools   map[int32]*WorkerPool
+	cdnSenders map[int32]*ExSender // per-job CDN senders; never placed in exSenders cache
 
 	throttle *byteThrottle
 
@@ -1179,6 +1188,19 @@ type cdnRedirect struct {
 	fileToken     []byte
 	encryptionKey []byte
 	encryptionIv  []byte
+
+	// Telegram supplies SHA-256 FileHash entries with the redirect and on
+	// demand from the master DC. CDN bytes are never trusted until every
+	// returned byte is covered by one of these entries and verifies.
+	hashMu sync.Mutex
+	hashes map[int64]*FileHash
+}
+
+func normalizeDownloadContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 func (c *Client) DownloadMedia(file any, Opts ...*DownloadOptions) (string, error) {
@@ -1305,10 +1327,7 @@ func (c *Client) newDownloadJob(file any, opts *DownloadOptions) (*downloadJob, 
 		}
 	}
 
-	ctx := opts.Ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx := normalizeDownloadContext(opts.Ctx)
 
 	job := &downloadJob{
 		client:      c,
@@ -1499,6 +1518,9 @@ func (j *downloadJob) runUnknownSize() error {
 		}
 		if len(data) == 0 {
 			tl.ReleaseLargeBuffer(result.data)
+			if j.knownSize && offset < j.size {
+				return fmt.Errorf("download incomplete: got %d of %d bytes", offset, j.size)
+			}
 			return nil
 		}
 		if _, err := j.destination.WriteAt(data, offset); err != nil {
@@ -1511,6 +1533,9 @@ func (j *downloadJob) runUnknownSize() error {
 		j.log.recordSuccess(index, nil)
 		offset += int64(n)
 		if n < part.limit {
+			if j.knownSize && offset < j.size {
+				return fmt.Errorf("download incomplete: got %d of %d bytes", offset, j.size)
+			}
 			return nil
 		}
 		if j.opts.Delay > 0 {
@@ -1542,7 +1567,10 @@ func (j *downloadJob) refreshFileReference() bool {
 }
 
 func (j *downloadJob) fetchPartLoop(ctx context.Context, pool *WorkerPool, part downloadRange) (downloadResult, error) {
-	const maxAttempts = 20
+	// FileToLink surfaces an unrecoverable mid-stream error to the HTTP client
+	// instead of retrying one missing part for tens of minutes. Keep a small
+	// bounded retry budget for reconnect jitter, then let the browser resume.
+	const maxAttempts = 3
 	const maxRefetches = 2
 	var lastErr error
 	for refetch := 0; refetch <= maxRefetches; refetch++ {
@@ -1561,11 +1589,16 @@ func (j *downloadJob) fetchPartLoop(ctx context.Context, pool *WorkerPool, part 
 				return downloadResult{}, failure.err
 			}
 
-			// On FILE_REFERENCE_EXPIRED, refresh the location and restart
-			// the attempt loop. Bounded by maxRefetches.
-			if strings.Contains(err.Error(), "FILE_REFERENCE_EXPIRED") && refetch < maxRefetches && j.refreshFileReference() {
-				j.client.Log.Info("file reference refreshed; retrying", "refetch", refetch+1)
-				break
+			// File-reference errors cannot recover by retrying the same
+			// location. Refresh once per cycle; if the caller cannot provide a
+			// fresh reference, fail promptly instead of spending 20×N retries
+			// near the end of an HTTP response (the classic 99% stall).
+			if isFileReferenceError(err) {
+				if refetch < maxRefetches && j.refreshFileReference() {
+					j.client.Log.Info("file reference refreshed; retrying", "refetch", refetch+1)
+					break
+				}
+				return downloadResult{}, fmt.Errorf("file reference refresh failed: %w", err)
 			}
 
 			if sleepErr := j.sleepRetry(ctx, failure, attempt); sleepErr != nil {
@@ -1574,6 +1607,16 @@ func (j *downloadJob) fetchPartLoop(ctx context.Context, pool *WorkerPool, part 
 		}
 	}
 	return downloadResult{}, fmt.Errorf("part %d failed after %d attempts: %w", part.index, maxAttempts, lastErr)
+}
+
+func isFileReferenceError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "FILE_REFERENCE_EXPIRED") ||
+		strings.Contains(msg, "FILE_REFERENCE_INVALID") ||
+		strings.Contains(msg, "FILE_REFERENCE_EMPTY")
 }
 
 func (j *downloadJob) fetchPart(ctx context.Context, pool *WorkerPool, part downloadRange, attempt int) (downloadResult, error) {
@@ -1635,18 +1678,54 @@ func (j *downloadJob) fetchPart(ctx context.Context, pool *WorkerPool, part down
 }
 
 func (j *downloadJob) activateCDN(r *UploadFileCdnRedirect) error {
+	if r == nil || r.DcID <= 0 || len(r.FileToken) == 0 {
+		return errors.New("invalid CDN redirect")
+	}
 	j.cdnMu.Lock()
 	defer j.cdnMu.Unlock()
-	if j.cdn != nil && j.cdn.dcID == r.DcID {
+	if j.cdn != nil && j.cdn.dcID == r.DcID && bytes.Equal(j.cdn.fileToken, r.FileToken) {
+		j.cdn.mergeHashes(r.FileHashes)
 		return nil
 	}
 	j.cdn = &cdnRedirect{
 		dcID:          r.DcID,
-		fileToken:     r.FileToken,
-		encryptionKey: r.EncryptionKey,
-		encryptionIv:  r.EncryptionIv,
+		fileToken:     append([]byte(nil), r.FileToken...),
+		encryptionKey: append([]byte(nil), r.EncryptionKey...),
+		encryptionIv:  append([]byte(nil), r.EncryptionIv...),
+		hashes:        make(map[int64]*FileHash),
 	}
+	j.cdn.mergeHashes(r.FileHashes)
 	j.client.Log.Info(fmt.Sprintf("cdn redirect: switching to CDN DC%d", r.DcID))
+	return nil
+}
+
+func (c *cdnRedirect) mergeHashes(hashes []*FileHash) {
+	if c == nil || len(hashes) == 0 {
+		return
+	}
+	c.hashMu.Lock()
+	defer c.hashMu.Unlock()
+	if c.hashes == nil {
+		c.hashes = make(map[int64]*FileHash)
+	}
+	for _, h := range hashes {
+		if h == nil || h.Offset < 0 || h.Limit <= 0 || len(h.Hash) != sha256.Size {
+			continue
+		}
+		// Copy the value and digest so a caller cannot mutate verified state.
+		c.hashes[h.Offset] = &FileHash{Offset: h.Offset, Limit: h.Limit, Hash: append([]byte(nil), h.Hash...)}
+	}
+}
+
+func (c *cdnRedirect) hashAt(offset int64) *FileHash {
+	if c == nil {
+		return nil
+	}
+	c.hashMu.Lock()
+	defer c.hashMu.Unlock()
+	if h := c.hashes[offset]; h != nil {
+		return &FileHash{Offset: h.Offset, Limit: h.Limit, Hash: append([]byte(nil), h.Hash...)}
+	}
 	return nil
 }
 
@@ -1663,10 +1742,67 @@ func (j *downloadJob) cdnPool(_ context.Context, dc int32) (*WorkerPool, error) 
 	if err != nil {
 		return nil, fmt.Errorf("creating cdn sender: %w", err)
 	}
+	sender := NewExSender(conn)
 	pool := NewWorkerPool(1)
-	pool.AddWorker(NewExSender(conn))
+	pool.AddWorker(sender)
 	j.cdnPools[dc] = pool
+	if j.cdnSenders == nil {
+		j.cdnSenders = make(map[int32]*ExSender)
+	}
+	j.cdnSenders[dc] = sender
 	return pool, nil
+}
+
+func (j *downloadJob) fetchCDNHashes(ctx context.Context, cdn *cdnRedirect, offset int64) error {
+	if j == nil || j.client == nil {
+		return errors.New("CDN hash lookup has no master client")
+	}
+	response, err := j.client.MakeRequestCtx(ctx, &UploadGetCdnFileHashesParams{
+		FileToken: cdn.fileToken,
+		Offset:    offset,
+	})
+	if err != nil {
+		return fmt.Errorf("getting CDN hashes at %d: %w", offset, err)
+	}
+	hashes, ok := response.([]*FileHash)
+	if !ok || len(hashes) == 0 {
+		return fmt.Errorf("getting CDN hashes at %d: invalid response %T", offset, response)
+	}
+	cdn.mergeHashes(hashes)
+	return nil
+}
+
+// verifyCDNPart requires complete FileHash coverage. A partial hash block is
+// deliberately rejected rather than serving bytes that cannot be authenticated.
+func (j *downloadJob) verifyCDNPart(ctx context.Context, cdn *cdnRedirect, offset int64, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	end := offset + int64(len(data))
+	for pos := offset; pos < end; {
+		h := cdn.hashAt(pos)
+		if h == nil {
+			if err := j.fetchCDNHashes(ctx, cdn, pos); err != nil {
+				return err
+			}
+			h = cdn.hashAt(pos)
+		}
+		if h == nil || h.Limit <= 0 || h.Offset != pos {
+			return fmt.Errorf("missing CDN hash coverage at offset %d", pos)
+		}
+		segmentEnd := pos + int64(h.Limit)
+		if segmentEnd > end {
+			return fmt.Errorf("partial CDN hash block at offset %d", pos)
+		}
+		startIndex := int(pos - offset)
+		endIndex := int(segmentEnd - offset)
+		digest := sha256.Sum256(data[startIndex:endIndex])
+		if !bytes.Equal(digest[:], h.Hash) {
+			return fmt.Errorf("CDN hash mismatch at offset %d", pos)
+		}
+		pos = segmentEnd
+	}
+	return nil
 }
 
 func (j *downloadJob) fetchPartCDN(ctx context.Context, cdn *cdnRedirect, part downloadRange, attempt int) (downloadResult, error) {
@@ -1707,7 +1843,12 @@ func (j *downloadJob) fetchPartCDN(ctx context.Context, cdn *cdnRedirect, part d
 
 	switch v := response.(type) {
 	case *UploadCdnFileObj:
-		decryptCDNBlock(v.Bytes, cdn.encryptionKey, cdn.encryptionIv, part.offset)
+		if err := decryptCDNBlock(v.Bytes, cdn.encryptionKey, cdn.encryptionIv, part.offset); err != nil {
+			return downloadResult{}, err
+		}
+		if err := j.verifyCDNPart(reqCtx, cdn, part.offset, v.Bytes); err != nil {
+			return downloadResult{}, err
+		}
 		return downloadResult{part: part, data: v.Bytes}, nil
 	case *UploadCdnFileReuploadNeeded:
 		if err := j.reuploadCDN(reqCtx, cdn, v.RequestToken); err != nil {
@@ -1722,30 +1863,48 @@ func (j *downloadJob) fetchPartCDN(ctx context.Context, cdn *cdnRedirect, part d
 }
 
 func (j *downloadJob) reuploadCDN(ctx context.Context, cdn *cdnRedirect, requestToken []byte) error {
-	_, err := j.client.MakeRequestCtx(ctx, &UploadReuploadCdnFileParams{
+	response, err := j.client.MakeRequestCtx(ctx, &UploadReuploadCdnFileParams{
 		FileToken:    cdn.fileToken,
 		RequestToken: requestToken,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	hashes, ok := response.([]*FileHash)
+	if !ok {
+		return fmt.Errorf("invalid CDN reupload response %T", response)
+	}
+	cdn.mergeHashes(hashes)
+	return nil
 }
 
 func (j *downloadJob) closeCDNPools() {
 	j.cdnMu.Lock()
 	pools := j.cdnPools
+	senders := j.cdnSenders
 	j.cdnPools = nil
+	j.cdnSenders = nil
 	j.cdnMu.Unlock()
 	for _, p := range pools {
 		p.Close()
 	}
+	for _, sender := range senders {
+		if sender != nil {
+			_ = sender.Terminate()
+		}
+	}
 }
 
-func decryptCDNBlock(data, key, iv []byte, offset int64) {
-	if len(data) == 0 || len(iv) != aes.BlockSize {
-		return
+func decryptCDNBlock(data, key, iv []byte, offset int64) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if len(iv) != aes.BlockSize {
+		return fmt.Errorf("invalid CDN IV length %d", len(iv))
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return
+		return fmt.Errorf("creating CDN cipher: %w", err)
 	}
 	ivCopy := make([]byte, aes.BlockSize)
 	copy(ivCopy, iv)
@@ -1753,6 +1912,7 @@ func decryptCDNBlock(data, key, iv []byte, offset int64) {
 	binary.BigEndian.PutUint32(ivCopy[12:16], counter)
 	stream := cipher.NewCTR(block, ivCopy)
 	stream.XORKeyStream(data, data)
+	return nil
 }
 
 func (j *downloadJob) makeGetFileRequest(part downloadRange) tl.Object {
@@ -1792,7 +1952,6 @@ func (j *downloadJob) classifyError(ctx context.Context, err error) downloadFail
 		return downloadFailure{kind: downloadErrFlood, err: err, wait: wait}
 	}
 	fatal := []string{
-		"FILE_REFERENCE_INVALID",
 		"TAKEOUT_INVALID",
 		"LOCATION_INVALID",
 		"OFFSET_INVALID",
@@ -1967,8 +2126,9 @@ func initializeWorkersWithMode(numWorkers int, dc int32, c *Client, w *WorkerPoo
 // Callers may pass arbitrary byte offsets; each fetch is aligned to a 4096
 // boundary and the excess is trimmed per-iteration to avoid buffering bytes
 // the caller did not request. An optional *DownloadOptions can be supplied
-// to enable RefetchFileReference on FILE_REFERENCE_EXPIRED.
+// to enable RefetchFileReference on refreshable FILE_REFERENCE_* errors.
 func (c *Client) DownloadChunkCtx(ctx context.Context, media any, start int, end int, chunkSize int, opts ...*DownloadOptions) ([]byte, string, error) {
+	ctx = normalizeDownloadContext(ctx)
 	if err := validateDownloadChunkSize(chunkSize); err != nil {
 		return nil, "", err
 	}
@@ -2002,9 +2162,18 @@ func (c *Client) DownloadChunkCtx(ctx context.Context, media any, start int, end
 	if size > 0 && end > int(size) {
 		end = int(size)
 	}
+	// The clamp above can move end behind start when callers have stale
+	// metadata. Do not pass a negative length to downloadRangeAligned.
+	if end <= start {
+		return nil, name, fmt.Errorf("requested range [%d,%d) is outside file size %d", start, end, size)
+	}
 
 	job := c.newChunkDownloadJob(ctx, input, dc, size, chunkSize, opts)
 	defer job.log.Flush()
+	// A range fetch can receive a CDN redirect just like DownloadMedia. Its
+	// dedicated CDN senders are owned by this job and must be terminated before
+	// DownloadChunkCtx returns.
+	defer job.closeCDNPools()
 
 	pool := NewWorkerPool(1)
 	defer pool.Close()
@@ -2043,6 +2212,9 @@ func (c *Client) newChunkDownloadJob(ctx context.Context, input InputFileLocatio
 // chunks, trimming over-fetched bytes per-iteration. Returns the assembled
 // buffer and the file name.
 func (c *Client) downloadRangeAligned(job *downloadJob, pool *WorkerPool, start, end, chunkSize int64, name string) ([]byte, string, error) {
+	if end <= start {
+		return nil, name, fmt.Errorf("invalid download range [%d,%d)", start, end)
+	}
 	contentLength := end - start
 	buf := make([]byte, 0, contentLength)
 	written := int64(0)
@@ -2075,6 +2247,9 @@ func (c *Client) downloadRangeAligned(job *downloadJob, pool *WorkerPool, start,
 		}
 	}
 
+	if written != contentLength {
+		return nil, "", fmt.Errorf("range download incomplete: got %d of %d bytes", written, contentLength)
+	}
 	return buf, name, nil
 }
 
@@ -2107,9 +2282,13 @@ func alignedFetchRange(offset, end, chunkSize int64) (alignedOffset int64, skip,
 	alignedOffset = offset &^ 4095 // round down to nearest 4096
 	skip = int(offset - alignedOffset)
 
-	rawLimit := chunkSize
-	if remaining := end - offset; remaining < rawLimit {
-		rawLimit = remaining
+	// The wire request starts at alignedOffset, not offset. Include the
+	// leading skip in the requested span so a small unaligned HTTP range does
+	// not need an avoidable tail request. A full 1 MiB unaligned range still
+	// needs two requests because Telegram caps one wire request at 1 MiB.
+	rawLimit := end - alignedOffset
+	if rawLimit > chunkSize {
+		rawLimit = chunkSize
 	}
 	limit = int(rawLimit)
 	if r := limit % 4096; r != 0 { // round up to nearest 4096
